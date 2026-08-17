@@ -9,6 +9,8 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
 <style>
   :root{
     --bg:#F7F3EA;
@@ -231,6 +233,7 @@
   <div class="app-title">مکتب نورانیه مند میتاب</div>
   <div class="app-sub">سامانه جامع مدیریت مکتب قرآنی</div>
   <div class="hijri-line">🕌 <span id="todayLabel">—</span></div>
+  <div class="hijri-line" id="syncStatus" style="opacity:.75; font-size:.7rem;">⏳ در حال اتصال...</div>
 </header>
 <div class="tile-divider"></div>
 
@@ -377,25 +380,89 @@
 <div class="toast" id="toast"></div>
 
 <script>
-/* ---------- storage helpers (works inside Claude preview AND as installed standalone PWA) ---------- */
-const hasClaudeStorage = (typeof window!=='undefined' && window.storage && typeof window.storage.get==='function');
+/* ---------- شناسهٔ پایگاه‌دادهٔ آنلاین (Firebase) ----------
+   این بخش را بعد از ساخت پروژهٔ Firebase با اطلاعات خودتان جایگزین کنید.
+   تا وقتی جایگزین نشده، اپلیکیشن به‌صورت محلی (فقط روی همین گوشی) کار می‌کند. */
+const firebaseConfig = {
+  apiKey: "PASTE_YOUR_API_KEY",
+  authDomain: "PASTE_YOUR_PROJECT.firebaseapp.com",
+  projectId: "PASTE_YOUR_PROJECT_ID",
+  storageBucket: "PASTE_YOUR_PROJECT.appspot.com",
+  messagingSenderId: "PASTE_YOUR_SENDER_ID",
+  appId: "PASTE_YOUR_APP_ID"
+};
+
+/* رمز مدیریت — فقط با این رمز می‌شود اطلاعات را ثبت/ویرایش/حذف کرد.
+   برای تغییر آن، همین‌جا عدد/متن جدید را جایگزین کنید. */
+const ADMIN_PIN = "1368";
+
+let db = null;
+try{
+  if(firebaseConfig.apiKey && firebaseConfig.apiKey.indexOf('PASTE_')!==0){
+    firebase.initializeApp(firebaseConfig);
+    db = firebase.firestore();
+  }
+}catch(e){ console.error('firebase init error', e); }
+
+/* ---------- storage helpers: از Firestore (مشترک برای همه) استفاده می‌کند؛
+   اگر Firebase تنظیم نشده باشد، به‌صورت محلی روی همان گوشی کار می‌کند ---------- */
 async function sget(key, fallback){
+  if(db){
+    try{
+      const doc = await db.collection('maktabData').doc(key).get();
+      return doc.exists ? doc.data().v : fallback;
+    }catch(e){ console.error('sget error', e); showToast('خطا در اتصال به سرور — نمایش اطلاعات محلی'); }
+  }
   try{
-    if(hasClaudeStorage){
-      const r = await window.storage.get(key, false);
-      return r ? JSON.parse(r.value) : fallback;
-    } else {
-      const raw = localStorage.getItem('maktab:'+key);
-      return raw!==null ? JSON.parse(raw) : fallback;
-    }
+    const raw = localStorage.getItem('maktab:'+key);
+    return raw!==null ? JSON.parse(raw) : fallback;
   }catch(e){ return fallback; }
 }
 async function sset(key, value){
-  try{
-    if(hasClaudeStorage){ await window.storage.set(key, JSON.stringify(value), false); }
-    else{ localStorage.setItem('maktab:'+key, JSON.stringify(value)); }
-  }catch(e){ console.error('storage error', e); showToast('خطا در ذخیره‌سازی'); }
+  if(db){
+    try{ await db.collection('maktabData').doc(key).set({ v: value, updatedAt: Date.now() }); return; }
+    catch(e){ console.error('sset error', e); showToast('خطا در ذخیره‌سازی آنلاین'); }
+  }
+  try{ localStorage.setItem('maktab:'+key, JSON.stringify(value)); }
+  catch(e){ console.error('storage error', e); showToast('خطا در ذخیره‌سازی'); }
 }
+
+/* ---------- قفل مدیریت: فقط با رمز درست می‌شود چیزی ثبت/ویرایش/حذف کرد ---------- */
+function isUnlocked(){ return sessionStorage.getItem('maktabUnlocked')==='1'; }
+function ensureUnlocked(){
+  if(isUnlocked()) return true;
+  const entered = prompt('برای ثبت یا ویرایش اطلاعات، رمز مدیریت را وارد کنید:');
+  if(entered===null) return false;
+  if(entered===ADMIN_PIN){
+    sessionStorage.setItem('maktabUnlocked','1');
+    showToast('حالت مدیریت فعال شد ✓');
+    return true;
+  }
+  showToast('رمز نادرست است');
+  return false;
+}
+
+/* ---------- گوش‌دادن زنده به تغییرات (تا هرکس اپ را باز کند، آخرین اطلاعات را ببیند) ---------- */
+function watchLiveUpdates(){
+  if(!db) return;
+  ['students','classes','teachers','quranRecords'].forEach(key=>{
+    db.collection('maktabData').doc(key).onSnapshot(doc=>{
+      if(!doc.exists) return;
+      const val = doc.data().v;
+      if(key==='students') students = val || [];
+      if(key==='classes') classes = val || [];
+      if(key==='teachers') teachers = val || [];
+      if(key==='quranRecords') quranRecords = val || {};
+      refreshClassSelects();
+      renderDashboard();
+      renderStudents();
+      renderTeachers();
+      renderClasses();
+      renderQuranList();
+    }, err=>console.error('live update error', err));
+  });
+}
+
 function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
 function showToast(msg){
   const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show');
@@ -408,6 +475,9 @@ let students=[], classes=[], teachers=[], quranRecords={};
 
 /* ---------- init ---------- */
 async function init(){
+  const syncEl = document.getElementById('syncStatus');
+  if(db){ syncEl.textContent = '🟢 متصل به سرور مشترک — اطلاعات برای همه به‌روز است'; }
+  else{ syncEl.textContent = '🟡 حالت محلی — اطلاعات فقط روی همین گوشی است'; }
   document.getElementById('todayLabel').textContent = new Date().toLocaleDateString('fa-IR',{weekday:'long', year:'numeric', month:'long', day:'numeric'});
   document.getElementById('attDate').value = todayISO();
   document.getElementById('stEnroll').value = todayISO();
@@ -424,6 +494,7 @@ async function init(){
   renderClasses();
   renderAttendanceList();
   renderQuranList();
+  watchLiveUpdates();
 }
 
 /* ---------- nav ---------- */
@@ -497,6 +568,7 @@ function openStudentModal(id){
   openModal('studentModalBg');
 }
 async function saveStudent(){
+  if(!ensureUnlocked()) return;
   const name = document.getElementById('stName').value.trim();
   if(!name){ showToast('نام طلبه را وارد کنید'); return; }
   const id = document.getElementById('studentId').value;
@@ -518,6 +590,7 @@ async function saveStudent(){
   showToast('اطلاعات طلبه ذخیره شد');
 }
 async function deleteStudent(id){
+  if(!ensureUnlocked()) return;
   if(!confirm('آیا از حذف این طلبه مطمئن هستید؟')) return;
   students = students.filter(s=>s.id!==id);
   await sset('students', students);
@@ -554,6 +627,7 @@ function openTeacherModal(){
   openModal('teacherModalBg');
 }
 async function saveTeacher(){
+  if(!ensureUnlocked()) return;
   const name = document.getElementById('tchName').value.trim();
   if(!name){ showToast('نام استاد را وارد کنید'); return; }
   teachers.push({ id: uid(), name, subject: document.getElementById('tchSubject').value.trim(), phone: document.getElementById('tchPhone').value.trim() });
@@ -564,6 +638,7 @@ async function saveTeacher(){
   showToast('استاد ثبت شد');
 }
 async function deleteTeacher(id){
+  if(!ensureUnlocked()) return;
   if(!confirm('حذف این استاد؟')) return;
   teachers = teachers.filter(t=>t.id!==id);
   await sset('teachers', teachers);
@@ -586,6 +661,7 @@ function openClassModal(){
   openModal('classModalBg');
 }
 async function saveClass(){
+  if(!ensureUnlocked()) return;
   const name = document.getElementById('clsName').value.trim();
   if(!name){ showToast('نام کلاس را وارد کنید'); return; }
   classes.push({ id: uid(), name, teacherId: document.getElementById('clsTeacher').value });
@@ -596,6 +672,7 @@ async function saveClass(){
   showToast('کلاس ایجاد شد');
 }
 async function deleteClass(id){
+  if(!ensureUnlocked()) return;
   if(!confirm('حذف این کلاس؟ (طلاب آن بدون کلاس می‌مانند)')) return;
   classes = classes.filter(c=>c.id!==id);
   students = students.map(s=> s.classId===id? {...s, classId:''} : s);
@@ -645,6 +722,7 @@ function setAtt(sid, status){
   row.querySelector('.att-btn.'+status).classList.add('on');
 }
 async function saveAttendance(){
+  if(!ensureUnlocked()) return;
   const date = document.getElementById('attDate').value || todayISO();
   const classId = document.getElementById('attClassSel').value;
   if(!classId){ showToast('کلاس را انتخاب کنید'); return; }
@@ -711,6 +789,7 @@ function recalcAll(){
   });
 }
 async function saveGrades(){
+  if(!ensureUnlocked()) return;
   const classId = document.getElementById('gradeClassSel').value;
   const term = document.getElementById('gradeTermSel').value;
   if(!classId){ showToast('کلاس را انتخاب کنید'); return; }
@@ -750,6 +829,7 @@ async function renderQuranList(){
   }).join('');
 }
 async function updateQuran(sid, field, value){
+  if(!ensureUnlocked()) return;
   if(!quranRecords[sid]) quranRecords[sid] = { juz:0, surah:'', notes:'' };
   quranRecords[sid][field] = field==='juz' ? parseInt(value)||0 : value;
   await sset('quranRecords', quranRecords);
